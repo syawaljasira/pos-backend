@@ -15,8 +15,12 @@ export const getOrders = async (req, res) => {
         COALESCE(
           json_agg(
             json_build_object(
-              'id', oi.id, 'menu_id', oi.menu_id, 'menu_name', m.name,
-              'qty', oi.qty, 'price', oi.price, 'subtotal', oi.subtotal
+              'id', oi.id, 
+              'menu_id', oi.menu_id, 
+              'menu_name', m.name,
+              'qty', oi.qty, 
+              'price', oi.price, 
+              'subtotal', oi.subtotal
             )
           ) FILTER (WHERE oi.id IS NOT NULL),
           '[]'::json

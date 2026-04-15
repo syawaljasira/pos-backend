@@ -13,9 +13,10 @@ export const getCategoryById = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const rows = await pool.query("SELECT * FROM categories WHERE id = $1", [
-      id,
-    ]);
+    const { rows } = await pool.query(
+      "SELECT * FROM categories WHERE id = $1",
+      [id],
+    );
 
     if (!rows.length) return res.status(404).json({ message: "Not Found" });
     res.json(rows[0]);
@@ -26,11 +27,11 @@ export const getCategoryById = async (req, res) => {
 
 export const createCategory = async (req, res) => {
   try {
-    const { name, description } = req.body;
+    const { name, description, icon } = req.body;
 
-    const rows = await pool.query(
-      "INSERT INTO categories (name, description) VALUES ($1, $2) RETURNING *",
-      [name, description || null],
+    const { rows } = await pool.query(
+      "INSERT INTO categories (name, description, icon) VALUES ($1, $2, $3) RETURNING *",
+      [name, description || null, icon || null],
     );
     res.status(201).json(rows[0]);
   } catch (error) {
