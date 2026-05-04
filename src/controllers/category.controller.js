@@ -36,11 +36,11 @@ export const getCategoryById = async (req, res) => {
 
 export const createCategory = async (req, res) => {
   try {
-    const { name, description, icon } = req.body;
+    const { name, description, icon, is_active } = req.body;
 
     const { rows } = await pool.query(
-      "INSERT INTO categories (name, description, icon) VALUES ($1, $2, $3) RETURNING *",
-      [name, description || null, icon || null],
+      "INSERT INTO categories (name, description, icon, is_active) VALUES ($1, $2, $3, $4) RETURNING *",
+      [name, description || null, icon || null, is_active],
     );
 
     res.json({
@@ -58,7 +58,7 @@ export const updateCategory = async (req, res) => {
     const { id } = req.params;
     const { name, description, icon, is_active } = req.body;
 
-    if (typeof is_active === "boolean") {
+    if (typeof is_active === "boolean" && !name) {
       const { rows } = await pool.query(
         `UPDATE categories 
        SET is_active = $1 
