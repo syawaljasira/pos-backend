@@ -3,18 +3,18 @@ import {
   getOrders,
   getOrderById,
   createOrder,
-  updateOrder,
-  payOrder,
+  updateOrderStatus,
   cancelOrder,
+  getOrderNumber,
 } from "../controllers/order.controller.js";
 
 const router = Router();
 
+router.get("/order-number", getOrderNumber);
 router.get("/", getOrders); // ?status=open&table_id=1
 router.get("/:id", getOrderById);
 router.post("/", createOrder);
-router.put("/:id", updateOrder);
-router.post("/:id/pay", payOrder);
-router.delete("/:id", cancelOrder); // atau POST /:id/cancel
+router.patch("/:id/status", updateOrderStatus);
+router.patch("/:id/cancel", cancelOrder); // atau POST /:id/cancel
 
 export default router;

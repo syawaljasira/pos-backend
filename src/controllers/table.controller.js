@@ -1,5 +1,42 @@
 import pool from "../config/db.js";
 
+// Query helper agar tidak duplikasi
+const getFloorWithTables = async (floorId) => {
+  const { rows } = await pool.query(
+    `
+    SELECT
+      floor_id,
+      floor_name,
+      JSON_AGG(
+        JSON_BUILD_OBJECT(
+          'capacity', capacity,
+          'tables',   tables
+        ) ORDER BY capacity
+      ) AS tables_by_capacity
+    FROM (
+      SELECT
+        f.id   AS floor_id,
+        f.name AS floor_name,
+        t.capacity,
+        JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'id',     t.id,
+            'name',   t.name,
+            'status', t.status
+          ) ORDER BY t.id
+        ) FILTER (WHERE t.id IS NOT NULL) AS tables
+      FROM floors f
+      LEFT JOIN tables t ON t.floor_id = f.id
+      WHERE f.id = $1
+      GROUP BY f.id, f.name, t.capacity
+    ) grouped
+    GROUP BY floor_id, floor_name
+    `,
+    [floorId],
+  );
+  return rows[0];
+};
+
 export const getTables = async (req, res) => {
   try {
     const { floor_id, status } = req.query;
@@ -97,8 +134,7 @@ export const createTable = async (req, res) => {
 
     const { rows } = await pool.query(
       `INSERT INTO tables (floor_id, name, capacity, status)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
+       VALUES ($1, $2, $3, $4)`,
       [
         parseInt(floor_id),
         name,
@@ -107,7 +143,8 @@ export const createTable = async (req, res) => {
       ],
     );
 
-    res.status(201).json(rows[0]);
+    const updatedTables = await getFloorWithTables(parseInt(floor_id));
+    res.status(201).json(updatedTables);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -116,38 +153,24 @@ export const createTable = async (req, res) => {
 export const updateTable = async (req, res) => {
   try {
     const { id } = req.params;
-    const { floor_id, name, capacity, status } = req.body;
+    const { name, capacity, status } = req.body;
 
-    // Kalau pindah floor, cek floor tujuan exist
-    if (floor_id) {
-      const floor = await pool.query(`SELECT id FROM floors WHERE id = $1`, [
-        floor_id,
-      ]);
-      if (!floor.rows.length) {
-        return res.status(404).json({ message: "Floor not found" });
-      }
-    }
-
-    const { rows } = await pool.query(
+    // Step 1 — Update
+    const { rows: updated } = await pool.query(
       `UPDATE tables
        SET
-         floor_id = COALESCE($1, floor_id),
-         name     = COALESCE($2, name),
-         capacity = COALESCE($3, capacity),
-         status   = COALESCE($4, status)
-       WHERE id = $5
-       RETURNING *`,
-      [
-        floor_id ? parseInt(floor_id) : null,
-        name || null,
-        capacity ? parseInt(capacity) : null,
-        status || null,
-        id,
-      ],
+         name     = COALESCE($1, name),
+         capacity = COALESCE($2, capacity),
+         status   = COALESCE($3, status)
+       WHERE id = $4
+       RETURNING floor_id`,
+      [name || null, capacity ? parseInt(capacity) : null, status || null, id],
     );
 
-    if (!rows.length) return res.status(404).json({ message: "Not found" });
-    res.json(rows[0]);
+    if (!updated.length) return res.status(404).json({ message: "Not found" });
+
+    const updatedFloor = await getFloorWithTables(updated[0].floor_id);
+    res.json(updatedFloor);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -178,11 +201,20 @@ export const updateTableStatus = async (req, res) => {
 export const deleteTable = async (req, res) => {
   try {
     const { id } = req.params;
-    const { rowCount } = await pool.query(`DELETE FROM tables WHERE id = $1`, [
-      id,
-    ]);
-    if (!rowCount) return res.status(404).json({ message: "Not found" });
-    res.status(204).send();
+
+    // Simpan floor_id sebelum dihapus
+    const { rows: existing } = await pool.query(
+      `SELECT floor_id FROM tables WHERE id = $1`,
+      [id],
+    );
+    if (!existing.length) return res.status(404).json({ message: "Not found" });
+
+    const floorId = existing[0].floor_id;
+
+    await pool.query(`DELETE FROM tables WHERE id = $1`, [id]);
+
+    const updatedFloor = await getFloorWithTables(floorId);
+    res.status(200).json(updatedFloor); // 200 bukan 204 agar bisa return body
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

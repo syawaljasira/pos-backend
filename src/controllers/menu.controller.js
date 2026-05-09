@@ -57,6 +57,58 @@ export const getMenuById = async (req, res) => {
   }
 };
 
+export const getMenusWithCategories = async (req, res) => {
+  try {
+    const { search } = req.query;
+
+    const params = [];
+    let menuFilter = `m.is_active = true`;
+
+    if (search) {
+      params.push(`%${search.toLowerCase()}%`);
+      menuFilter += ` AND LOWER(m.name) LIKE $${params.length}`;
+    }
+
+    const { rows } = await pool.query(
+      `
+      SELECT
+        c.id          AS category_id,
+        c.name        AS category_name,
+        c.description AS category_description,
+        c.icon        AS category_icon,
+        COUNT(m.id)   AS menu_length,
+        COALESCE(
+          JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'menu_id',          m.id,
+              'menu_name',        m.name,
+              'menu_price',       m.price::float,
+              'menu_description', m.description,
+              'menu_image',       m.image_url,
+              'menu_stock',       m.stock
+            ) ORDER BY m.id
+          ) FILTER (WHERE m.id IS NOT NULL AND ${menuFilter}),
+          '[]'
+        ) AS menu_list
+      FROM categories c
+      LEFT JOIN menus m ON m.category_id = c.id
+      GROUP BY c.id, c.name, c.description, c.icon
+      ORDER BY c.id
+      `,
+      params,
+    );
+
+    // Kalau ada search, filter category yang menu_list nya kosong
+    const filtered = search
+      ? rows.filter((cat) => cat.menu_list.length > 0)
+      : rows;
+
+    res.json(filtered);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 export const createMenu = async (req, res) => {
   try {
     const { category_id, name, description, price, stock, is_active } =
