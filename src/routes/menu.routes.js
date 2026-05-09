@@ -5,6 +5,7 @@ import {
   createMenu,
   updateMenu,
   deleteMenu,
+  getMenusWithCategories,
 } from "../controllers/menu.controller.js";
 import { upload } from "../config/cloudinary.js";
 
@@ -12,6 +13,7 @@ const router = Router();
 
 // upload.single("image") → nama field form-data harus "image"
 router.get("/", getMenus);
+router.get("/with-categories", getMenusWithCategories);
 router.get("/:id", getMenuById);
 router.post("/", upload.single("image"), createMenu);
 router.put("/:id", upload.single("image"), updateMenu);

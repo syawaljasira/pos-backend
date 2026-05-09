@@ -1,53 +1,85 @@
 import pool from "../config/db.js";
+import { generateOrderNumber } from "../utils/index.js";
 
-const validPaymentMethods = ["cash", "qris", "card", "transfer"];
+const validPaymentMethods = ["cash", "qris"];
+
+const getOrderQuery = `
+  SELECT
+    o.*,
+    t.name AS table_name,
+    f.name AS floor_name,
+    COALESCE(
+      JSON_AGG(
+        JSON_BUILD_OBJECT(
+          'item_id',    oi.id,
+          'menu_id',    oi.menu_id,
+          'menu_name',  oi.menu_name,
+          'menu_image', oi.menu_image,
+          'menu_price', oi.menu_price::float,
+          'qty',        oi.qty,
+          'note',       oi.note,
+          'subtotal',   oi.subtotal::float
+        ) ORDER BY oi.id
+      ) FILTER (WHERE oi.id IS NOT NULL),
+      '[]'
+    ) AS order_items
+  FROM orders o
+  LEFT JOIN tables t ON t.id = o.table_id
+  LEFT JOIN floors f ON t.floor_id = f.id
+  LEFT JOIN order_items oi ON oi.order_id = o.id
+`;
+
+const formatOrder = (row) => ({
+  order_id: row.id,
+  order_number: row.order_number,
+  order_type: row.order_type,
+  order_status: row.status,
+  order_table_id: row.table_id,
+  order_table: row.table_name,
+  order_floor: row.floor_name,
+  order_customer: row.customer_name,
+  order_subtotal: parseFloat(row.order_subtotal),
+  order_tax: parseFloat(row.tax),
+  order_discount: parseFloat(row.discount),
+  order_total: parseFloat(row.total),
+  order_items: row.order_items,
+  payments: row.payments,
+  created_at: row.created_at,
+  paid_at: row.paid_at,
+});
+
+// ─── Controllers ──────────────────────────────────────────────────────────────
 
 export const getOrders = async (req, res) => {
   try {
-    const { status, table_id } = req.query;
-
-    let sql = `
-      SELECT 
-        o.id, o.table_id, o.status, o.total, o.discount, o.tax,
-        o.payment_method, o.payment_amount,
-        o.created_at, o.paid_at, o.customer_name,
-        t.name AS table_name,
-        COALESCE(
-          json_agg(
-            json_build_object(
-              'id', oi.id, 
-              'menu_id', oi.menu_id, 
-              'menu_name', m.name,
-              'qty', oi.qty, 
-              'price', oi.price, 
-              'subtotal', oi.subtotal
-            )
-          ) FILTER (WHERE oi.id IS NOT NULL),
-          '[]'::json
-        ) AS items
-      FROM orders o
-      LEFT JOIN tables t ON t.id = o.table_id
-      LEFT JOIN order_items oi ON oi.order_id = o.id
-      LEFT JOIN menus m ON m.id = oi.menu_id
-    `;
+    const { status, order_type, table_id } = req.query;
 
     const params = [];
-    let paramIndex = 1;
+    const conditions = [];
 
     if (status) {
-      sql += ` WHERE o.status = $${paramIndex}`;
       params.push(status);
-      paramIndex++;
+      conditions.push(`o.status = $${params.length}`);
+    }
+    if (order_type) {
+      params.push(order_type);
+      conditions.push(`o.order_type = $${params.length}`);
     }
     if (table_id) {
-      const whereClause = sql.includes("WHERE") ? " AND" : " WHERE";
-      sql += ` ${whereClause} o.table_id = $${paramIndex}`;
-      params.push(table_id);
+      params.push(parseInt(table_id));
+      conditions.push(`o.table_id = $${params.length}`);
     }
 
-    sql += ` GROUP BY o.id, t.name ORDER BY o.created_at DESC`;
-    const { rows } = await pool.query(sql, params);
-    res.json(rows);
+    const whereClause = conditions.length
+      ? `WHERE ${conditions.join(" AND ")}`
+      : "";
+
+    const { rows } = await pool.query(
+      `${getOrderQuery} ${whereClause} GROUP BY o.id, t.name, f.name ORDER BY o.created_at DESC`,
+      params,
+    );
+
+    res.json(rows.map(formatOrder));
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -56,93 +88,119 @@ export const getOrders = async (req, res) => {
 export const getOrderById = async (req, res) => {
   try {
     const { id } = req.params;
-    const { rows: orderRows } = await pool.query(
-      `SELECT o.*, t.name AS table_name FROM orders o LEFT JOIN tables t ON t.id = o.table_id WHERE o.id = $1`,
+    const { rows } = await pool.query(
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
       [id],
     );
-
-    if (!orderRows.length)
+    if (!rows.length)
       return res.status(404).json({ message: "Order not found" });
-
-    const order = orderRows[0];
-    const { rows: items } = await pool.query(
-      `SELECT oi.*, m.name AS menu_name FROM order_items oi JOIN menus m ON m.id = oi.menu_id WHERE oi.order_id = $1`,
-      [id],
-    );
-
-    res.json({ ...order, items });
+    res.json(formatOrder(rows[0]));
   } catch (err) {
     res.status(500).json({ message: err.message });
+  }
+};
+
+export const getOrderNumber = async (req, res) => {
+  try {
+    const client = await pool.connect();
+
+    const order_number = await generateOrderNumber(client);
+
+    res.json({ order_number });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 };
 
 export const createOrder = async (req, res) => {
   const client = await pool.connect();
   try {
-    const { table_id, items, customer_name, discount, tax, payment_method } =
-      req.body;
+    const {
+      order_table_id,
+      order_customer,
+      order_type = "POS",
+      order_items,
+      order_subtotal = 0,
+      order_tax = 0,
+      order_discount = 0,
+      order_total = 0,
+    } = req.body;
 
-    if (!items?.length)
-      return res.status(400).json({ message: "Items required" });
-    if (payment_method && !validPaymentMethods.includes(payment_method)) {
-      return res.status(400).json({
-        message: `Invalid payment_method. Allowed: ${validPaymentMethods.join(", ")}`,
-      });
+    if (!order_items?.length) {
+      return res
+        .status(400)
+        .json({ message: "Order items tidak boleh kosong" });
     }
 
     await client.query("BEGIN");
 
-    const orderRes = await client.query(
-      `INSERT INTO orders (table_id, status, customer_name, discount, tax, payment_method) 
-       VALUES ($1, 'open', $2, $3, $4, $5) RETURNING *`,
+    const order_number = await generateOrderNumber(client);
+
+    // Insert order dulu
+    const { rows: orderRows } = await client.query(
+      `INSERT INTO orders (order_number, table_id, customer_name, order_type, order_subtotal, tax, discount, total)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
       [
-        table_id,
-        customer_name || null,
-        discount || 0,
-        tax || 0,
-        payment_method || null,
+        order_number,
+        order_table_id || null,
+        order_customer || "",
+        order_type,
+        order_subtotal,
+        order_tax,
+        order_discount,
+        order_total,
       ],
     );
-    const order = orderRes.rows[0];
 
-    let total = 0;
-    for (const item of items) {
-      const { menu_id, qty } = item;
-      const menuRes = await client.query(
-        "SELECT price, stock FROM menus WHERE id = $1 AND is_active = true",
-        [menu_id],
+    const orderId = orderRows[0].id;
+
+    // Insert order_items + kurangi stok
+    for (const item of order_items) {
+      const { rows: menuRows } = await client.query(
+        `SELECT id, name, price, image_url, stock FROM menus WHERE id = $1 AND is_active = true`,
+        [item.menu_id],
       );
 
-      if (!menuRes.rows.length) throw new Error(`Menu ${menu_id} not found`);
-      if (menuRes.rows[0].stock < qty) throw new Error(`Insufficient stock`);
+      if (!menuRows.length)
+        throw new Error(
+          `Menu ${item.menu_name ?? item.menu_id} tidak ditemukan`,
+        );
+      if (menuRows[0].stock < item.quantity)
+        throw new Error(`Stok ${menuRows[0].name} tidak cukup`);
 
-      const { price } = menuRes.rows[0];
-      const subtotal = price * qty;
-      total += subtotal;
+      const menu = menuRows[0];
 
       await client.query(
-        `INSERT INTO order_items (order_id, menu_id, qty, price, subtotal) VALUES ($1, $2, $3, $4, $5)`,
-        [order.id, menu_id, qty, price, subtotal],
+        `INSERT INTO order_items (order_id, menu_id, menu_name, menu_price, menu_image, category_id, qty, note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          orderId,
+          menu.id,
+          menu.name,
+          menu.price,
+          menu.image_url || null,
+          item.category_id || null,
+          item.quantity,
+          item.note || null,
+        ],
       );
 
-      await client.query("UPDATE menus SET stock = stock - $1 WHERE id = $2", [
-        qty,
-        menu_id,
+      await client.query(`UPDATE menus SET stock = stock - $1 WHERE id = $2`, [
+        item.quantity,
+        menu.id,
       ]);
     }
 
-    const updateOrderRes = await client.query(
-      "UPDATE orders SET total = $1 WHERE id = $2 RETURNING *",
-      [total, order.id],
-    );
-
-    await client.query("UPDATE tables SET status = $1 WHERE id = $2", [
-      "occupied",
-      table_id,
-    ]);
     await client.query("COMMIT");
 
-    res.status(201).json(updateOrderRes.rows[0]);
+    // Fetch ulang dengan format lengkap
+    const { rows } = await pool.query(
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      [orderId],
+    );
+
+    res.status(201).json(formatOrder(rows[0]));
   } catch (err) {
     await client.query("ROLLBACK");
     res.status(400).json({ message: err.message });
@@ -151,81 +209,34 @@ export const createOrder = async (req, res) => {
   }
 };
 
-export const updateOrder = async (req, res) => {
+export const updateOrderStatus = async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, discount, tax, payment_method } = req.body;
+    const { status } = req.body;
 
-    if (payment_method && !validPaymentMethods.includes(payment_method)) {
+    const validStatus = ["pending", "completed", "cancelled"];
+    if (!validStatus.includes(status)) {
       return res.status(400).json({
-        message: `Invalid payment_method. Allowed: ${validPaymentMethods.join(", ")}`,
+        message: `Status tidak valid. Pilihan: ${validStatus.join(", ")}`,
       });
     }
 
     const { rows } = await pool.query(
-      `UPDATE orders SET 
-         status = COALESCE($1, status),
-         discount = COALESCE($2, discount),
-         tax = COALESCE($3, tax),
-         payment_method = COALESCE($4, payment_method)
-       WHERE id = $5 RETURNING *`,
-      [status, discount, tax, payment_method, id],
+      `UPDATE orders SET status = $1 WHERE id = $2 RETURNING *`,
+      [status, id],
     );
 
     if (!rows.length)
       return res.status(404).json({ message: "Order not found" });
-    res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-};
 
-export const payOrder = async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-    const { payment_method, payment_amount } = req.body;
-
-    if (!payment_method || !payment_amount) {
-      return res
-        .status(400)
-        .json({ message: "payment_method & payment_amount required" });
-    }
-    if (!validPaymentMethods.includes(payment_method)) {
-      return res.status(400).json({
-        message: `Invalid payment_method. Allowed: ${validPaymentMethods.join(", ")}`,
-      });
-    }
-
-    await client.query("BEGIN");
-
-    const { rows } = await client.query(
-      `UPDATE orders SET 
-         status = 'paid', paid_at = NOW(),
-         payment_method = $1, payment_amount = $2
-       WHERE id = $3 AND status != 'paid' RETURNING *`,
-      [payment_method, payment_amount, id],
+    const { rows: updated } = await pool.query(
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      [id],
     );
 
-    if (!rows.length) {
-      await client.query("ROLLBACK");
-      return res
-        .status(400)
-        .json({ message: "Order not found or already paid" });
-    }
-
-    await client.query("UPDATE tables SET status = $1 WHERE id = $2", [
-      "available",
-      rows[0].table_id,
-    ]);
-    await client.query("COMMIT");
-
-    res.json(rows[0]);
+    res.json(formatOrder(updated[0]));
   } catch (err) {
-    await client.query("ROLLBACK");
     res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
   }
 };
 
@@ -234,37 +245,41 @@ export const cancelOrder = async (req, res) => {
   try {
     const { id } = req.params;
 
-    await client.query("BEGIN");
-
-    const { rows } = await client.query(
-      "SELECT table_id FROM orders WHERE id = $1 AND status = $2",
-      [id, "open"],
-    );
-    if (!rows.length) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Open order not found" });
-    }
-
-    await client.query("UPDATE orders SET status = $1 WHERE id = $2", [
-      "canceled",
-      id,
-    ]);
-    await client.query("UPDATE tables SET status = $1 WHERE id = $2", [
-      "available",
-      rows[0].table_id,
-    ]);
-
-    // Restore stock
-    await client.query(
-      `
-      UPDATE menus m SET stock = m.stock + oi.qty
-      FROM order_items oi WHERE oi.menu_id = m.id AND oi.order_id = $1
-    `,
+    const { rows: existing } = await client.query(
+      `SELECT * FROM orders WHERE id = $1`,
       [id],
     );
 
+    if (!existing.length)
+      return res.status(404).json({ message: "Order not found" });
+    if (existing[0].status === "completed") {
+      return res
+        .status(400)
+        .json({ message: "Order yang sudah completed tidak bisa dibatalkan" });
+    }
+
+    await client.query("BEGIN");
+
+    // Restore stok
+    await client.query(
+      `UPDATE menus m SET stock = m.stock + oi.qty
+       FROM order_items oi
+       WHERE oi.menu_id = m.id AND oi.order_id = $1`,
+      [id],
+    );
+
+    await client.query(`UPDATE orders SET status = 'cancelled' WHERE id = $1`, [
+      id,
+    ]);
+
     await client.query("COMMIT");
-    res.json({ message: "Order canceled" });
+
+    const { rows } = await pool.query(
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      [id],
+    );
+
+    res.json(formatOrder(rows[0]));
   } catch (err) {
     await client.query("ROLLBACK");
     res.status(500).json({ message: err.message });
