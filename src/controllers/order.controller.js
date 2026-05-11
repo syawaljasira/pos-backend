@@ -89,7 +89,7 @@ export const getOrderById = async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await pool.query(
-      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name, f.name`,
       [id],
     );
     if (!rows.length)
@@ -154,7 +154,6 @@ export const createOrder = async (req, res) => {
     );
 
     const orderId = orderRows[0].id;
-
     // Insert order_items + kurangi stok
     for (const item of order_items) {
       const { rows: menuRows } = await client.query(
@@ -196,8 +195,8 @@ export const createOrder = async (req, res) => {
 
     // Fetch ulang dengan format lengkap
     const { rows } = await pool.query(
-      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
-      [orderId],
+      `${getOrderQuery} WHERE o.id = $1 AND o.table_id = $2 GROUP BY o.id, t.name, f.name`,
+      [orderId, order_table_id],
     );
 
     res.status(201).json(formatOrder(rows[0]));
@@ -230,7 +229,7 @@ export const updateOrderStatus = async (req, res) => {
       return res.status(404).json({ message: "Order not found" });
 
     const { rows: updated } = await pool.query(
-      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name, f.name`,
       [id],
     );
 
@@ -275,7 +274,7 @@ export const cancelOrder = async (req, res) => {
     await client.query("COMMIT");
 
     const { rows } = await pool.query(
-      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name, f.name`,
       [id],
     );
 
