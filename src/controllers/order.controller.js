@@ -52,7 +52,7 @@ const formatOrder = (row) => ({
 
 export const getOrders = async (req, res) => {
   try {
-    const { status, order_type, table_id } = req.query;
+    const { status, order_type, table_id, start_date, end_date } = req.query;
 
     const params = [];
     const conditions = [];
@@ -68,6 +68,15 @@ export const getOrders = async (req, res) => {
     if (table_id) {
       params.push(parseInt(table_id));
       conditions.push(`o.table_id = $${params.length}`);
+    }
+    if (start_date) {
+      const end = end_date || start_date; // jika tidak ada end_date, pakai start_date
+      params.push(start_date);
+      conditions.push(`o.created_at >= $${params.length}::date`);
+      params.push(end);
+      conditions.push(
+        `o.created_at < ($${params.length}::date + INTERVAL '1 day')`,
+      );
     }
 
     const whereClause = conditions.length
@@ -89,7 +98,7 @@ export const getOrderById = async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await pool.query(
-      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name, f.name`,
       [id],
     );
     if (!rows.length)
@@ -154,7 +163,6 @@ export const createOrder = async (req, res) => {
     );
 
     const orderId = orderRows[0].id;
-
     // Insert order_items + kurangi stok
     for (const item of order_items) {
       const { rows: menuRows } = await client.query(
@@ -195,17 +203,154 @@ export const createOrder = async (req, res) => {
     await client.query("COMMIT");
 
     // Fetch ulang dengan format lengkap
-    const { rows } = await pool.query(
-      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
-      [orderId],
-    );
+    let result;
 
-    res.status(201).json(formatOrder(rows[0]));
+    if (order_table_id !== null && order_table_id) {
+      const { rows } = await pool.query(
+        `${getOrderQuery} WHERE o.id = $1 AND o.table_id = $2 GROUP BY o.id, t.name, f.name`,
+        [orderId, order_table_id],
+      );
+
+      result = rows[0];
+    } else {
+      const { rows } = await pool.query(
+        `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name, f.name`,
+        [orderId],
+      );
+
+      result = rows[0];
+    }
+
+    res.status(201).json(formatOrder(result));
   } catch (err) {
     await client.query("ROLLBACK");
     res.status(400).json({ message: err.message });
   } finally {
     client.release();
+  }
+};
+
+export const updateOrder = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { id } = req.params;
+    const {
+      order_table_id,
+      order_customer,
+      order_type = "POS",
+      order_items,
+      order_subtotal = 0,
+      order_tax = 0,
+      order_discount = 0,
+      order_total = 0,
+    } = req.body;
+
+    if (!order_items?.length) {
+      return res
+        .status(400)
+        .json({ message: "Order items tidak boleh kosong" });
+    }
+
+    await client.query("BEGIN");
+
+    // Pastikan order ada
+    const { rows: existingOrder } = await client.query(
+      `SELECT id FROM orders WHERE id = $1`,
+      [id],
+    );
+    if (!existingOrder.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Order tidak ditemukan" });
+    }
+
+    // Update header order
+    await client.query(
+      `UPDATE orders
+       SET
+         table_id       = $2,
+         customer_name  = $3,
+         order_type     = $4,
+         order_subtotal = $5,
+         tax            = $6,
+         discount       = $7,
+         total          = $8
+       WHERE id = $1`,
+      [
+        id,
+        order_table_id || null,
+        order_customer || "",
+        order_type,
+        order_subtotal,
+        order_tax,
+        order_discount,
+        order_total,
+      ],
+    );
+
+    // Kembalikan stok dari order_items lama sebelum dihapus
+    const { rows: oldItems } = await client.query(
+      `SELECT menu_id, qty FROM order_items WHERE order_id = $1`,
+      [id],
+    );
+    for (const old of oldItems) {
+      await client.query(`UPDATE menus SET stock = stock + $1 WHERE id = $2`, [
+        old.qty,
+        old.menu_id,
+      ]);
+    }
+
+    // Hapus order_items lama
+    await client.query(`DELETE FROM order_items WHERE order_id = $1`, [id]);
+
+    // Insert order_items baru + kurangi stok
+    for (const item of order_items) {
+      const { rows: menuRows } = await client.query(
+        `SELECT id, name, price, image_url, stock FROM menus WHERE id = $1 AND is_active = true`,
+        [item.menu_id],
+      );
+
+      if (!menuRows.length)
+        throw new Error(
+          `Menu ${item.menu_name ?? item.menu_id} tidak ditemukan`,
+        );
+      if (menuRows[0].stock < item.quantity)
+        throw new Error(`Stok ${menuRows[0].name} tidak cukup`);
+
+      const menu = menuRows[0];
+
+      await client.query(
+        `INSERT INTO order_items (order_id, menu_id, menu_name, menu_price, menu_image, category_id, qty, note)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          id,
+          menu.id,
+          menu.name,
+          menu.price,
+          menu.image_url || null,
+          item.category_id || null,
+          item.quantity,
+          item.note || null,
+        ],
+      );
+
+      await client.query(`UPDATE menus SET stock = stock - $1 WHERE id = $2`, [
+        item.quantity,
+        menu.id,
+      ]);
+    }
+
+    await client.query("COMMIT");
+
+    // Fetch ulang dengan format lengkap
+    const { rows: updated } = await pool.query(
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name, f.name`,
+      [id],
+    );
+
+    res.json(formatOrder(updated[0]));
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
 };
 
@@ -230,7 +375,7 @@ export const updateOrderStatus = async (req, res) => {
       return res.status(404).json({ message: "Order not found" });
 
     const { rows: updated } = await pool.query(
-      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name, f.name`,
       [id],
     );
 
@@ -275,7 +420,7 @@ export const cancelOrder = async (req, res) => {
     await client.query("COMMIT");
 
     const { rows } = await pool.query(
-      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name`,
+      `${getOrderQuery} WHERE o.id = $1 GROUP BY o.id, t.name, f.name`,
       [id],
     );
 
